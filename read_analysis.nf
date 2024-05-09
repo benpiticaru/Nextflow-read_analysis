@@ -1,16 +1,15 @@
 #!/usr/bin/env nextflow
-params.sample_sheet = "/home/bdpitica/scratch/RNA_vs_mRNA/scripts/final_sample_sheet.csv"
-params.outdir = "final_exp_4.out"
-params.genome_reference = "/home/bdpitica/scratch/RNA_vs_mRNA/reference/Homo_sapiens.GRCh38.cdna.all.fa"
-params.cds_reference = "/home/bdpitica/scratch/RNA_vs_mRNA/reference/Homo_sapiens.GRCh38.cds.all.fa"
-params.bed_reference = "/home/bdpitica/scratch/RNA_vs_mRNA/reference/Homo_sapiens_GRCh38_110.bed"
+params.sample_sheet = "/{path_to}/sample_sheet.csv"
+params.outdir = "exp_4.out"
+params.genome_reference = "/{path_to}/Homo_sapiens.GRCh38.dna.primary_assembly.fa"
+params.bed_reference = "/{path_to}/Homo_sapiens_GRCh38_110.bed"
 
 process readLengthandCountAnalysis {
     label "smallJob"
 
     input:
-        tuple val(sample_id) , val(replicate) , val(condition), path(fast5), path(fastq_dir), path(processed_fastq), val(output_file_count)
-        tuple file(read_lengths), file(sequence_info)
+        tuple val(sample_id) , val(replicate) , val(condition), path(fast5), path(fastq_dir), path(raw_fastq), path(processed_fastq), val(output_file_count)
+        file(sequence_info)
 
 
     output:
@@ -61,9 +60,9 @@ process splitReads {
     ml scipy-stack
 
     cat ${fastq_dir}/pass/*.fastq.gz > combined.fastq.gz
-    fastqwiper --fastq_in combined.fastq.gz --fastq_out ${sample_id}.cleaned.fastq.gz
-    seqkit split -s 1000000 -j ${task.cpus} ${sample_id}.cleaned.fastq.gz
-    new_files=\$(ls ${sample_id}.cleaned.fastq.gz.split/${sample_id}.cleaned.part_*.fastq.gz)
+    fastqwiper --fastq_in combined.fastq.gz --fastq_out ${sample_id}.fastq.gz
+    seqkit split -s 500000 -j ${task.cpus} ${sample_id}.fastq.gz
+    new_files=\$(ls ${sample_id}.fastq.gz.split/${sample_id}.part_*.fastq.gz)
     for file in \$new_files; do
         part_number="\${file##*_}"
         part_number="\${part_number%%.*}"
@@ -81,11 +80,11 @@ process removeAdaptors {
         tuple val(sample_id) , val(replicate) , val(condition), path(fast5), path(fastq_dir), path(raw_fastq), val(output_file_count)
 
     output:
-        tuple val(sample_id) , val(replicate) , val(condition), path(fast5), path(fastq_dir), path("${sample_id}.${output_file_count}.trimmed.fastq"), val(output_file_count)
+        tuple val(sample_id) , val(replicate) , val(condition), path(fast5), path(fastq_dir), path(raw_fastq), path("${sample_id}.${output_file_count}.trimmed.fastq"), val(output_file_count), emit: data
 
     script:
     """
-    porechop -i ${raw_fastq} -o "${sample_id}.${output_file_count}.trimmed.fastq" --threads ${task.cpus}
+    porechop -i ${raw_fastq} -o "${sample_id}.${output_file_count}.trimmed.fastq" --threads ${task.cpus} 
     """
 }
 
@@ -93,33 +92,53 @@ process alignAndSort {
     label "aligning"
 
     publishDir "${params.outdir}/alignments", mode: 'copy', pattern: "*.bam*"
-    publishDir "${params.outdir}", mode: 'copy', pattern: "read_lengths.tsv"
 
     input:
-        tuple val(sample_id) , val(replicate) , val(condition), path(fast5), path(fastq_dir), path(processed_fastq), val(output_file_count)
+        tuple val(sample_id) , val(replicate) , val(condition), path(fast5), path(fastq_dir), path(raw_fastq), path(processed_fastq), val(output_file_count)
         file genome_reference
-        file cds_reference
+        file reference_bed
 
     output:
-        tuple val(sample_id) , val(replicate) , val(condition), path(fast5), path(fastq_dir), path(processed_fastq), val(output_file_count), emit: read_info
-        tuple path("read_lengths.tsv"),path("sequence_info.csv"), emit: read_metrics
-        tuple path("${sample_id}.${output_file_count}.cds.bam.bai"), path("${sample_id}.${output_file_count}.cds.bam"), emit: cds_alignments
+        tuple val(sample_id) , val(replicate) , val(condition), path(fast5), path(fastq_dir), path(raw_fastq), path(processed_fastq), val(output_file_count), emit: read_info
+        path("${sample_id}.${output_file_count}.read_metrics.tsv"), emit: read_metrics
+        path("sequence_info.csv"), emit: sequencing_metrics
         tuple path("${sample_id}.${output_file_count}.dna.bam.bai"), path("${sample_id}.${output_file_count}.dna.bam"), emit: dna_alignments
 
     script:
     """
-    minimap2 -t ${task.cpus} -ax splice ${genome_reference} ${processed_fastq} | samtools sort -@ ${task.cpus} | samtools view -F 2308 -o ${sample_id}.${output_file_count}.dna.bam -
+    ml minimap2 samtools bedtools scipy-stack seqtk
+    seqtk seq -a ${processed_fastq} > reads.fasta
+    minimap2 -t ${task.cpus} -ax splice ${genome_reference} reads.fasta > aligned.sam
+    samtools sort -@ ${task.cpus} aligned.sam | samtools view -@ ${task.cpus} -F 260 -q 60 -O BAM -o ${sample_id}.${output_file_count}.dna.bam -
     samtools index -@ ${task.cpus} ${sample_id}.${output_file_count}.dna.bam
-    echo -e "sample_id\treplicate\tcondition\tcontig\tread_length\tmapping_score" > read_lengths.tsv
-    samtools view ${sample_id}.${output_file_count}.dna.bam | awk -v sample_id="${sample_id}" -v replicate="${replicate}" -v condition="${condition}" \
-        '{if (length(\$10) > 1) print sample_id"\t"replicate"\t"condition"\t"\$3"\t"length(\$10)"\t"\$5}' >> read_lengths.tsv
+   
+    grep -w "gene" ${reference_bed} | sort > gene_only.bed
 
-    minimap2 -t ${task.cpus} -ax splice ${cds_reference} combined.fastq.gz | samtools sort -@ ${task.cpus} | samtools view -F 2308 -o ${sample_id}.${output_file_count}.cds.bam -
-    samtools index -@ ${task.cpus} ${sample_id}.${output_file_count}.cds.bam
+    bedtools bamtobed -i ${sample_id}.${output_file_count}.dna.bam > reads.bed
+
+    samtools view ${sample_id}.${output_file_count}.dna.bam | awk '{print length(\$10)}' | paste reads.bed - > read_lengths.bed
+
+    bedtools intersect -f 0.90 -r -a read_lengths.bed -b gene_only.bed -wb | \
+        awk -v OFS='\t' '{print \$4, \$11, \$10-\$9, \$7}' | \
+        sed 's/"//; s/";//' -  | sort -t \$'\t' -k 1 > gene_intersects.bed
+
+    grep "gene_biotype" gene_only.bed | \
+        sed -E 's/.*gene_id "([^"]*)".*gene_biotype "([^"]*)".*/\\1\t\\2/' | uniq > gene_id_biotype.tsv
+
+    python3 - <<EOF
+    import pandas as pd
+    df1 = pd.read_csv("gene_id_biotype.tsv",sep='\t',header=None,names=["gene_id","gene_type"])
+    df2 = pd.read_csv("gene_intersects.bed",sep='\t',header=None,names=["readname","gene_id","gene_length","read_length"])
+    merged_df = pd.merge(df1, df2, on="gene_id")
+    merged_df["sample_id"] = "${sample_id}"
+    merged_df["replicate"] = "${replicate}"
+    merged_df["condition"] = "${condition}"
+    merged_df.to_csv("${sample_id}.${output_file_count}.read_metrics.tsv",sep="\t",header=False,index=False)
+    EOF
 
     primary_alignments=\$(samtools view -c ${sample_id}.${output_file_count}.dna.bam)
-    cds_alignments=\$(samtools view -c ${sample_id}.${output_file_count}.cds.bam)
-    bases_mapped=\$(samtools view -F 4 ${sample_id}.${output_file_count}.cds.bam | awk '{sum += length(\$10)} END {print sum}')
+    cds_alignments=\$(grep -o "protein_coding" ${sample_id}.${output_file_count}.read_metrics.tsv | wc -l)
+    bases_mapped=\$(grep -w "protein_coding" ${sample_id}.${output_file_count}.read_metrics.tsv | awk '{ sum += \$5 } END { print sum }')
 
     echo -ne "${sample_id},\$primary_alignments,\$cds_alignments,\$bases_mapped" > sequence_info.csv
     """
@@ -128,96 +147,95 @@ process alignAndSort {
 process polyATailAnalysis {
     label "polyA"
 
+    publishDir "${params.outdir}/polya", mode: 'copy', pattern: "*polya_length.tsv"
+
     input:
-        tuple val(sample_id) , val(replicate) , val(condition), path(fast5), path(fastq_dir), path(processed_fastq), val(output_file_count)
+        tuple val(sample_id) , val(replicate) , val(condition), path(fast5), path(fastq_dir), path(raw_fastq), path(processed_fastq), val(output_file_count)
         tuple file(bam_bai), file(bam)
         file(genome_reference)
-
-    output:
-        file("${sample_id}.${output_file_count}.polya_length.tsv")
-
-    script:
-    """
-    nanopolish index -d ${fast5} -s ${fastq_dir}/sequencing_summary.txt ${processed_fastq}
-    nanopolish polya --threads ${task.cpus} --reads ${processed_fastq} --bam ${bam} --genome ${genome_reference} > ${sample_id}.${output_file_count}.polya_length.tsv
-    """
-}
-
-process addColumnstoPolya {
-    label "smallJob"
-
-    publishDir "${params.outdir}/polya", mode: 'copy', pattern: "*polya_length.tsv"
-    publishDir "${params.outdir}/read_lengths", mode: 'copy', pattern: "*read_length.tsv"
-
-    input:
-        tuple val(sample_id) , val(replicate) , val(condition), path(fast5), path(fastq_dir), path(processed_fastq), val(output_file_count)
-        file polya_tsv
-        file read_info
 
     output:
         path("${sample_id}.${output_file_count}.polya_length.tsv"), emit: polya_length_tsv
 
     script:
-        $/
-        python3 - <<EOF
-        import os
-        import pandas as pd
-        columns = ['readname','transcript_id','read_length','transcript_length','gene_type','sample_id','replicate','condition']
-        df = pd.read_csv("${polya_tsv}",sep='\t',header=0)
-        df = df[df["qc_tag"] == "PASS"]
-
-        read_gene_df = pd.read_csv("${read_info}",sep='\t',header=0,names=columns)
-
-        merged_df = pd.merge(df, read_gene_df, left_on='readname', right_on='readname', how='left')
-        merged_df.drop(columns=['readname'], inplace=True)
-
-        merged_df["sample_id"] = "${sample_id}"
-        merged_df["replicate"] = "${replicate}"
-        merged_df["condition"] = "${condition}"
-        merged_df = merged_df[['sample_id','replicate','condition','transcript_id','polya_length']]
-        merged_df.to_csv("${sample_id}.${output_file_count}.polya_length.tsv", index=False, sep='\t',header=False)
-        EOF
-        /$
+    """
+    ml StdEnv/2020 gcc/9.3.0 nanopolish/0.13.2
+    nanopolish index --directory=${fast5} --sequencing-summary=${fastq_dir}/sequencing_summary.txt ${raw_fastq}
+    nanopolish polya --threads=1 --reads=${raw_fastq} --bam=${bam} --genome=${genome_reference} > polya.output
+    grep -w "PASS" polya.output | \
+        awk -v OFS='\t' -v sample_id=${sample_id} -v replicate=${replicate} -v condition=${condition} '{print sample_id, replicate, condition, \$1, \$9}' \
+            > ${sample_id}.${output_file_count}.polya_length.tsv
+    """
 }
 
 process polyaGraphing {
     label "smallJob"
 
-    publishDir "${params.outdir}/graphs", mode: 'copy', pattern: "*.png"
+    publishDir "${params.outdir}/graphs", mode: 'copy', pattern: "PolyA_length_boxplot.png"
+    publishDir "${params.outdir}/tables", mode: 'copy', pattern: "anova_tukey_output.txt"
 
     input:
         file polya_tsv
 
     output:
-        file("*.png")
-    
+        file("PolyA_length_boxplot.png")
+        file("anova_tukey_output.txt")
+
     script:
         $/
         python3 - <<EOF
         import pandas as pd
+        import numpy as np
         import seaborn as sns
         import matplotlib.pyplot as plt
+        from ast import literal_eval
+        from scipy.stats import f_oneway
+        from statsmodels.stats.multicomp import pairwise_tukeyhsd
 
-        columns = ['sample_id','replicate','condition','reference_name','polya_length']
-        df = pd.read_csv("${polya_tsv}",sep='\t',header=None,names=columns)
+        def find_limits(data):
+                q1, q3 = np.percentile(data, [25, 75])
+                iqr = q3 - q1
+                lwr = q1 - 1.5 * iqr
+                upr = q3 + 1.5 * iqr
+                return lwr , upr
 
-        selected_df = df[df["condition"] == "selected"]
-        unselected_df = df[df["condition"] == "unselected"]
-        selected_df = selected_df.groupby(['reference_name', 'sample_id', 'replicate', 'condition'])['polya_length'].mean().reset_index(name='average_polya_length')
-        unselected_df = unselected_df.groupby(['reference_name', 'sample_id', 'replicate', 'condition'])['polya_length'].mean().reset_index(name='average_polya_length')
-        merged_df = pd.merge(selected_df, unselected_df, on='reference_name', how='inner')
+        df = pd.read_csv("${polya_tsv}",sep='\t',header=None,names=['sample_id','replicate','condition',"readname","tail_length"])
+        pivoted_df = df.pivot_table(index='readname',columns='sample_id',values='tail_length')
 
-        plt.figure(figsize=(8, 6))
+        for sample in pivoted_df.columns:
+            lwr, upr = find_limits(pivoted_df[sample].dropna())
+            pivoted_df = pivoted_df[(pivoted_df[sample] > lwr) & (pivoted_df[sample] <= upr) | pivoted_df[sample].isna()]
 
-        sns.regplot(x=merged_df['average_polya_length_x'], y=merged_df['average_polya_length_y'])
-        spearman_corr = merged_df['average_polya_length_x'].corr(merged_df['average_polya_length_y'], method='spearman')
-        plt.text(0.1, 0.9, f'Spearman R: {spearman_corr:.2f}', transform=plt.gca().transAxes)
+        data = []
+        groups = []
 
-        plt.xlabel('Selected PolyA Length')
-        plt.ylabel('Unselected PolyA Length')
+        for column in pivoted_df.columns:
+            column_data = pivoted_df[column].dropna().tolist()
+            data.extend(column_data)
+            groups.extend([column] * len(column_data))
+
+        anova_result = f_oneway(*[pivoted_df[column].dropna().tolist() for column in pivoted_df.columns])
+        anova_pvalue = anova_result.pvalue
+
+        if anova_pvalue < 0.05:
+            posthoc = pairwise_tukeyhsd(data, groups, alpha=0.05)
+            posthoc_output = posthoc.summary()
+        else:
+            posthoc_output = "No significant difference between groups."
+
+        with open("anova_tukey_output.txt", "w") as file:
+            file.write(f"ANOVA p-value: {anova_pvalue}\n\n")
+            file.write("Post-hoc Tukey HSD Test:\n")
+            file.write(str(posthoc_output))
+
+        plt.figure(figsize=(10, 6))
+        sns.boxplot(data=pivoted_df, fill=None,color="black")
+        plt.xlabel('Sample')
+        plt.ylabel('Tail Length')
         plt.title('')
-
-        plt.savefig("polyA_scatterplot.png",format="png")
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.savefig("PolyA_length_boxplot.png", format="png")
         EOF
         /$
 }
@@ -232,24 +250,23 @@ process combiningTsvFiles {
 
     output:
         file sequence_info
-        path("experiments_summary.tsv"), emit: experiments_summary
+        path("exp_summary.tsv"), emit: experiments_summary
+        path("experiments_summary.tsv")
     
     script:
     $/
     python3 - <<EOF
     import os
     import pandas as pd
+    import ast
 
     columns = ['sample_id' , 'primary_alignments' , 'cds_alignments' , 'bases_mapped', 'read_counts' , 'read_lengths', 'replicate','condition']
-
-    result_dataframe = pd.read_csv("${sequence_info}",sep=',',header=None)
-
-    result_dataframe.columns = columns
-
+    result_dataframe = pd.read_csv("${sequence_info}",sep=',',header=None,names=columns)
+    
     def combine_lists(series):
         combined_list = []
         for lst in series:
-            combined_list.extend(lst)
+            combined_list.extend(ast.literal_eval(lst))
         return combined_list
 
     aggregated_df = result_dataframe.groupby(['sample_id', 'replicate', 'condition'], as_index=False).agg({
@@ -260,10 +277,9 @@ process combiningTsvFiles {
         'read_counts': 'sum',
     })
 
-    result_dataframe.to_csv("experiments_summary.tsv", index=False, sep='\t')
-
-
-
+    final_df = aggregated_df[['sample_id' , 'primary_alignments' , 'cds_alignments' , 'bases_mapped', 'read_counts', 'replicate','condition']]
+    aggregated_df.to_csv("exp_summary.tsv", index=False, sep='\t')
+    final_df.to_csv("experiments_summary.tsv", index=False, sep='\t')
     EOF
     /$
 
@@ -273,12 +289,15 @@ process readLengthHistogram {
     label "smallJob"
 
     publishDir "${params.outdir}/graphs", mode: 'copy', pattern: "*.png"
+    publishDir "${params.outdir}/tables", mode: 'copy', pattern: "*.tsv"
 
     input:
         file experiments_summary
 
     output:
         file("*.png")
+        file("mann_whitney_u_test_result.tsv")
+        file("summary_statistics.tsv")
     
     script:
     $/
@@ -286,88 +305,51 @@ process readLengthHistogram {
     import pandas as pd
     import seaborn as sns
     import matplotlib.pyplot as plt
-    import ast
+    from ast import literal_eval
+    from scipy.stats import mannwhitneyu
 
-    df = pd.read_csv("${experiments_summary}",sep='\t',header=0)
-    selected_read_lengths = ast.literal_eval(df.loc[df["condition"] == "selected", "read_lengths"].values[0])
-    unselected_read_lengths = ast.literal_eval(df.loc[df["condition"] == "unselected", "read_lengths"].values[0])
-    selected_read_lengths = [x for x in selected_read_lengths if x <= 7000]
-    unselected_read_lengths = [x for x in unselected_read_lengths if x <= 7000]
-    plt.hist(unselected_read_lengths, bins=50, alpha=0.5, label='Unselected Reads')
-    plt.hist(selected_read_lengths, bins=50, alpha=0.5, label='Selected Reads')
+    df = pd.read_csv("${experiments_summary}", sep='\t', header=0)
+    df['read_lengths'] = df['read_lengths'].apply(literal_eval)
+
+    combined_read_lengths = []
+
+    for index, row in df.iterrows():
+        condition = row['condition']
+        read_lengths = row['read_lengths']
+        for length in read_lengths:
+            combined_read_lengths.append({'condition': condition, 'read_length': length})
+
+    combined_read_lengths_df = pd.DataFrame(combined_read_lengths)
+
+    combined_read_lengths_df = combined_read_lengths_df[combined_read_lengths_df['read_length'] <= 7000]
+
+    summary_stats = combined_read_lengths_df.groupby('condition')['read_length'].describe()
+    summary_stats.to_csv("summary_statistics.tsv", sep='\t',index=True)
+    print("Summary Statistics:")
+    print(summary_stats)
+
+
+    plt.figure(figsize=(10, 6))
+    sns.histplot(data=combined_read_lengths_df, x='read_length', hue='condition', bins=50)
     plt.xlabel('Read Length')
     plt.ylabel('Frequency')
-    plt.title('Histogram of Read lengths Between Conditons')
-    plt.legend()
-    plt.savefig("Read_length_histogram.png",format="png")
+    plt.title('')
+
+    selected_lengths = combined_read_lengths_df[combined_read_lengths_df['condition'] == 'selected']['read_length']
+    unselected_lengths = combined_read_lengths_df[combined_read_lengths_df['condition'] == 'unselected']['read_length']
+    statistic, p_value = mannwhitneyu(unselected_lengths, selected_lengths,alternative='greater')
+
+    print("Mann-Whitney U Test:")
+    print(f"Statistic: {statistic}")
+    print(f"P-value: {p_value}")
+
+    test_result_df = pd.DataFrame({"Statistic": [statistic], "P-value": [p_value]})
+    test_result_df.to_csv("mann_whitney_u_test_result.tsv", sep='\t', index=False)
+    plt.savefig("Read_length_histogram_by_condition.png", format="png")
     plt.close()
     EOF
     /$
 
-}
-
-process geneDiversityAnalysis {
-    label "smallJob"
-    
-    publishDir "${params.outdir}", mode: 'copy', pattern: "gene_biotype_counts.tsv"
-
-    input:
-        tuple val(sample_id) , val(replicate) , val(condition), path(fast5), path(fastq_dir), path(processed_fastq), val(output_file_count)
-        tuple path(bam_bai), path(bam)
-        file(bed_reference)
-        
-    output:
-        path("read_info.tsv")
-    script:
-        $/
-        python3 - <<EOF
-        import pysam
-        import pandas as pd
-
-        def extract_read_info_and_get_gene_names(bam_file):
-
-            df = pd.DataFrame({"readname":[],"transcript_id":[],"read_length":[],"transcript_length":[]})
-
-            with pysam.AlignmentFile(bam_file, "rb") as bam:
-                for read in bam:
-                    read_id = read.query_name
-                    reference_name = read.reference_name
-                    reference_name = reference_name.split('.')[0]
-                    read_length = read.query_length
-                    gene_length = read.reference_length
-                    new_row = pd.DataFrame({"readname":[read_id],"transcript_id":[reference_name], \
-                                            "read_length":[read_length],"transcript_length":[gene_length]})
-                    df = pd.concat([df,new_row], ignore_index=True)
-            return df
-
-        genes_df = extract_read_info_and_get_gene_names("${bam}")
-        gene_types = pd.read_csv("${bed_reference}",sep='\t',header=None)
-
-        s = gene_types.iloc[:, 9]
-        gene_info = []
-        for item in s:
-            attributes = item.split('; ')
-            gene_biotype = None
-            transcript_id = None
-            for attribute in attributes:
-                attribute = attribute.rstrip(';')
-                if 'gene_biotype' in attribute:
-                    gene_biotype = attribute.split(' ')[1].replace('"', '')
-                if 'transcript_id' in attribute:
-                    transcript_id = attribute.split(' ')[1].replace('"', '')
-            if gene_biotype and transcript_id:
-                gene_info.append((transcript_id, gene_biotype))
-
-        gene_info_df = pd.DataFrame(gene_info, columns=['transcript_id', 'gene_type']).drop_duplicates()
-
-        merged_df = pd.merge(genes_df, gene_info_df, on='transcript_id', how='inner')
-        merged_df.fillna('Unknown', inplace=True)
-        merged_df["sample_id"] = "${sample_id}"
-        merged_df["replicate"] = "${replicate}"
-        merged_df["condition"] = "${condition}"
-        merged_df.to_csv('read_info.tsv', sep='\t',header=False,index=False)
-        EOF
-        /$
 }
 
 process readLengthScatterplot {
@@ -386,47 +368,63 @@ process readLengthScatterplot {
     $/
     python3 - <<EOF
     import pandas as pd
+    import numpy as np
     import seaborn as sns
     import matplotlib.pyplot as plt
-    columns = ['readname','transcript_id','read_length','transcript_length','gene_type','sample_id','replicate','condition']
-    df = pd.read_csv("${read_lengths_tsv}", sep='\t', header=None,names=columns)
-    selected_df = df[df["condition"] == "selected"]
-    unselected_df = df[df["condition"] == "unselected"]
-    selected_df = selected_df.groupby(['transcript_id', 'sample_id','condition'])['read_length'].mean().reset_index(name='average_read_length')
-    unselected_df = unselected_df.groupby(['transcript_id', 'sample_id','condition'])['read_length'].mean().reset_index(name='average_read_length')
-    merged_df = pd.merge(selected_df, unselected_df, on='transcript_id', how='inner')
 
-    plt.figure(figsize=(8, 6))
-    sns.regplot(x=merged_df['average_read_length_x'], y=merged_df['average_read_length_y'])
-    spearman_corr = merged_df['average_read_length_x'].corr(merged_df['average_read_length_y'], method='spearman')
-    plt.text(0.1, 0.9, f'Spearman R: {spearman_corr:.2f}', transform=plt.gca().transAxes)
-    plt.xlabel('Selected Average Read Length')
-    plt.ylabel('Unselected Average Read Length')
-    plt.title('')
-    plt.savefig("read_length_scatterplot.png",format="png")
-    plt.close()
+    def log_mean_read_length(df):
+        length_df = df.groupby(['gene_id','condition'])['read_length'].mean().reset_index(name='average_read_length')
+        length_df['average_read_length'] = np.log(length_df['average_read_length'])
+        pivoted_df = length_df.pivot(index='gene_id', columns='condition', values='average_read_length').dropna()
+        return pivoted_df
 
-    counts_df = df.value_counts(subset=['condition','replicate','transcript_length','transcript_id']).reset_index(name='counts')
-    for col in counts_df.select_dtypes(include=['object']).columns:
-        counts_df[col] = counts_df[col].str.strip()
-    counts_df["counts"] /= (counts_df["transcript_length"] / 1_000)
-    read_num = counts_df.groupby(["condition","replicate"])['counts'].sum().div(1_000_000).reset_index(name='rpm_count')
-    counts_df = pd.merge(counts_df, read_num, on=['condition','replicate'], how='left')
-    counts_df["counts"] /= (counts_df["rpm_count"])
-    counts_df = counts_df.groupby(['condition','transcript_id']).mean().reset_index()
-    selected_df = counts_df[counts_df["condition"] == "selected"]
-    unselected_df = counts_df[counts_df["condition"] == "unselected"]
-    merged_df = pd.merge(selected_df, unselected_df, on='transcript_id', how='inner')
+    def plot_scatter(df, x_col, y_col, xlabel, ylabel, title, filename):
+        plt.figure(figsize=(8, 6))
+        plt.scatter(df[x_col], df[y_col], color="black", s=2, label='_nolegend_')  
+        slope, intercept = np.polyfit(df[x_col], df[y_col], 1) 
+        plt.plot(df[x_col], slope * df[x_col] + intercept, color='#1f77b4', label='Regression Line')  
+        spearman_corr = df[x_col].corr(df[y_col], method='spearman')
+        plt.text(0.03, 0.875, f'Spearman R: {spearman_corr:.2f}', transform=plt.gca().transAxes, va='top', ha='left') 
+        plt.xlabel(xlabel)
+        plt.ylabel(ylabel)
+        plt.title('')
+        plt.gca().set_aspect('equal', adjustable='box')
+        max_val = max(df[x_col].max(), df[y_col].max())
+        min_val = min(df[x_col].min(), df[y_col].min())
+        plt.plot([min_val, max_val], [min_val, max_val], color='red', label='x = y')
+        plt.legend(loc='upper left') 
+        plt.savefig(filename, format="png", bbox_inches='tight')
+        plt.close()
 
-    plt.figure(figsize=(8, 6))
-    sns.regplot(x=merged_df['counts_x'], y=merged_df['counts_y'])
-    spearman_corr = merged_df['counts_x'].corr(merged_df['counts_y'], method='spearman')
-    plt.text(0.1, 0.9, f'Spearman R: {spearman_corr:.2f}', transform=plt.gca().transAxes)
-    plt.xlabel('Selected TPM')
-    plt.ylabel('Unselected TPM')
-    plt.title('')
-    plt.savefig("TPM_scatterplot.png",format="png")
-    plt.close()
+
+    def log_tpm(df):
+        counts_df = df.value_counts(subset=['condition', 'gene_length', 'gene_id']).reset_index(name='counts')
+        counts_df = counts_df[counts_df["counts"] >= 5]
+        counts_df["counts_cpk"] = counts_df["counts"] / (counts_df["gene_length"] / 1000)
+        rpm_count = counts_df.groupby(["condition"])['counts_cpk'].sum().div(1_000_000).reset_index(name='rpm_count')
+        counts_df = pd.merge(counts_df, rpm_count, on=['condition'], how='left')
+        counts_df["tpm"] = (counts_df["counts_cpk"] / counts_df["rpm_count"])
+        counts_df["log_tpm"] = np.log(counts_df["tpm"])
+        counts_df.replace(-np.inf, np.nan, inplace=True)
+        pivoted_df = counts_df.pivot(index='gene_id', columns='condition', values='log_tpm').dropna()
+        return pivoted_df
+
+    def main():
+        columns = ['gene_id','gene_biotype','readname','gene_length','read_length','sample_id','replicate','condition']
+        df = pd.read_csv("${read_lengths_tsv}", sep='\t', header=None,names=columns)
+
+        length_df = log_mean_read_length(df)
+        plot_scatter(length_df, 'unselected', 'selected', 
+                    'Unselected Average Read Length (log)', 'Selected Average Read Length (log)', 
+                    'Read Length Scatterplot', 'read_length_scatterplot.png')
+
+        tpm_df = log_tpm(df)
+        plot_scatter(tpm_df, 'unselected', 'selected', 
+                    'Unselected TPM (log)', 'Selected TPM (log)', 
+                    'TPM Scatterplot', 'TPM_scatterplot.png')
+
+    if __name__ == "__main__":
+        main()
     EOF
     /$
 }
@@ -438,7 +436,7 @@ process geneMakeupGraph {
     publishDir "${params.outdir}/tables", mode: 'copy', pattern: "*.tsv"
 
     input:
-        file gene_type_coutns
+        file read_gene_ids
 
     output:
         file("gene_makeup_graph.png")
@@ -460,17 +458,16 @@ process geneMakeupGraph {
             '#e377c2', '#7f7f7f', '#bcbd22', '#17becf', '#ff9896', '#98df8a', 
             '#f7b6d2', '#c5b0d5', '#c49c94', '#dbdb8d', '#9edae5', '#ad494a']
 
-        columns = ['readname','transcript_id','read_length','transcript_length','gene_type','sample_id','replicate','condition']
-        merged_df = pd.read_csv("${gene_type_coutns}",sep='\t',header=None,names=columns)
+        columns = ['gene_id','gene_biotype','readname','gene_length','read_length','sample_id','replicate','condition']
+        merged_df = pd.read_csv("${read_gene_ids}",sep='\t',header=None,names=columns)
 
-        counts_df = merged_df.value_counts(subset=['gene_type','condition','replicate','transcript_length','transcript_id']).reset_index(name='counts')
+        counts_df = merged_df.value_counts(subset=['gene_biotype','condition','replicate','gene_length','gene_id']).reset_index(name='counts')
         for col in counts_df.select_dtypes(include=['object']).columns:
             counts_df[col] = counts_df[col].str.strip()
-        counts_df["counts"] /= (counts_df["transcript_length"] / 1_000)
         read_num = counts_df.groupby(["condition","replicate"])['counts'].sum(numeric_only=True).div(1_000_000).reset_index(name='rpm_count')
         counts_df = pd.merge(counts_df, read_num, on=['condition','replicate'], how='left')
         counts_df["counts"] /= (counts_df["rpm_count"])
-        counts_df = counts_df.groupby(['gene_type','condition','replicate']).sum(numeric_only=True).reset_index()
+        counts_df = counts_df.groupby(['gene_biotype','condition','replicate']).sum(numeric_only=True).reset_index()
 
         read_num = counts_df.groupby(["condition","replicate"])['counts'].sum().reset_index(name='total_count')
         counts_df = pd.merge(counts_df, read_num, on=['condition','replicate'], how='left')
@@ -479,11 +476,11 @@ process geneMakeupGraph {
         counts_df.drop(columns=["total_count"],inplace=True)
         others_df = counts_df[counts_df["counts"] < 0.5]
         others_df = others_df.groupby(["condition","replicate"])['counts'].sum(numeric_only=True).reset_index(name='counts')
-        others_df['gene_type'] = "Other"
+        others_df['gene_biotype'] = "Other"
         result_df = pd.concat([counts_df[counts_df['counts'] >= 0.5], others_df], ignore_index=True)
-        pivot_df = result_df.pivot_table(index=["condition","replicate"], columns='gene_type', values='counts', aggfunc='sum')
+        pivot_df = result_df.pivot_table(index=["condition","replicate"], columns='gene_biotype', values='counts', aggfunc='sum')
         mrna_subset = pivot_df[['protein_coding']].copy()
-        mrna_subset.loc[:,"Other"] = mrna_subset.loc[:,'protein_coding'].apply(lambda x: 100 - x)
+        mrna_subset.loc[:,"Other:"] = mrna_subset.loc[:,'protein_coding'].apply(lambda x: 100 - x)
         mrna_subset.reset_index(inplace=True)
 
         pivot_df.drop(columns="protein_coding",inplace=True)
@@ -495,13 +492,13 @@ process geneMakeupGraph {
         fig, axes = plt.subplots(nrows=1, ncols=2,sharex=True,figsize=(6,5))
         plt.subplots_adjust(left=.1375, bottom=.2, right=0.95, top=0.9, wspace=None, hspace=None)
         mrna_subset.plot(x="condition",kind='bar',stacked=True,ax=axes[0],linewidth=0,color=["#195190FF","#A2A2A1FF"]).legend(loc="right",bbox_to_anchor=(2.975, 0.95),frameon=False)
-        sorted_df.plot(x="condition",kind="bar",stacked=True,ax=axes[1],linewidth=0,color=pallete).legend(loc="right",bbox_to_anchor=(2.42, 0.625),frameon=False)
+        sorted_df.plot(x="condition",kind="bar",stacked=True,ax=axes[1],linewidth=0,color=pallete).legend(loc="right",bbox_to_anchor=(1.75, 0.8),frameon=False)
         for ax in axes:
             ax.set_xlabel("")
         fig.suptitle("")
         fig.supylabel("Percentage of Library (%)")
-        plt.text(-1.5,-8,"Sample",fontsize=14.5)
-        rectangle = patches.Rectangle((4.885, (18 - types_num)), .51, types_num,edgecolor='#A2A2A1FF',facecolor="#A2A2A1FF", linewidth=0,clip_on=False)
+        plt.text(-1.5,-5,"Sample",fontsize=14.5)
+        rectangle = patches.Rectangle((3.8, (16 - types_num)), .51, types_num,edgecolor='#A2A2A1FF',facecolor="#A2A2A1FF", linewidth=0,clip_on=False)
         ax.add_patch(rectangle)
         fig.savefig("gene_makeup_graph.png",format='png',bbox_inches='tight')
         mrna_subset.to_csv("gene_makeup_mrna.tsv",sep='\t')
@@ -514,14 +511,12 @@ process upsetPlot {
     label "python"
 
     publishDir "${params.outdir}/graphs", mode: 'copy', pattern: "*.png"
-    publishDir "${params.outdir}", mode: 'copy', pattern: "test.tsv"
 
     input:
         file read_gene_ids
 
     output:
         file("*.png")
-        file "test.tsv"
     
     script:
         $/
@@ -530,13 +525,10 @@ process upsetPlot {
         import pandas as pd
         import matplotlib.pyplot as plt
         from upsetplot import UpSet,plot,from_contents
-        columns = ['readname','transcript_id','read_length','transcript_length','gene_type','sample_id','replicate','condition']
-
+        columns = ['gene_id','gene_biotype','readname','gene_length','read_length','sample_id','replicate','condition']
         df = pd.read_csv("${read_gene_ids}",sep='\t',header=0,names=columns)
 
-        df.to_csv("test.tsv",sep='\t')
-
-        contig_dict = df[['transcript_id', 'sample_id']].drop_duplicates().groupby('sample_id')['transcript_id'].agg(list).to_dict()
+        contig_dict = df[['gene_id', 'sample_id']].drop_duplicates().groupby('sample_id')['gene_id'].agg(list).to_dict()
         binary_matrix = from_contents(contig_dict)
         ax_dict = UpSet(binary_matrix, subset_size="count", sort_by='-cardinality',show_counts=True,element_size=None).plot()
         plt.savefig("upset_plot.png", format="png")
@@ -548,7 +540,6 @@ process upsetPlot {
 
 workflow {
     genome_reference = file(params.genome_reference)
-    cds_reference = file(params.cds_reference)
     bed_reference = file(params.bed_reference)
     sample_sheet = file(params.sample_sheet)
 
@@ -565,15 +556,14 @@ workflow {
         .set { split_data_ch }
     
     removeAdaptors(split_data_ch)
-    alignAndSort(removeAdaptors.out,genome_reference,cds_reference)
-    geneDiversityAnalysis(alignAndSort.out.read_info,alignAndSort.out.dna_alignments,bed_reference)
-    readLengthandCountAnalysis(alignAndSort.out.read_info,alignAndSort.out.read_metrics)
-    polyATailAnalysis(alignAndSort.out.read_info,alignAndSort.out.cds_alignments,genome_reference)
-    addColumnstoPolya(alignAndSort.out.read_info,polyATailAnalysis.out,geneDiversityAnalysis.out)
+    alignAndSort(removeAdaptors.out.data,genome_reference,bed_reference)
+    read_info_tsv = alignAndSort.out.read_metrics.collectFile(name: 'all_read_info.tsv', newLine: true)
+    readLengthandCountAnalysis(alignAndSort.out.read_info,alignAndSort.out.sequencing_metrics)
+    polyATailAnalysis(alignAndSort.out.read_info,alignAndSort.out.dna_alignments,genome_reference)
     combiningTsvFiles(readLengthandCountAnalysis.out.collectFile(name: 'sequence_info.csv', newLine: true))
     readLengthHistogram(combiningTsvFiles.out.experiments_summary)
-    polyaGraphing(addColumnstoPolya.out.polya_length_tsv.collectFile(name: 'all_polya_lengths.tsv', newLine: true))
-    readLengthScatterplot(geneDiversityAnalysis.out.collectFile(name: 'all_read_lengths.tsv', newLine: true))
-    geneMakeupGraph(geneDiversityAnalysis.out.collectFile(name: 'all_read_info.tsv', newLine: true))
-    upsetPlot(geneDiversityAnalysis.out.collectFile(name: 'all_gene_names.tsv', newLine: true))
+    polyaGraphing(polyATailAnalysis.out.polya_length_tsv.collectFile(name: 'all_polya_lengths.tsv', newLine: true))
+    readLengthScatterplot(read_info_tsv)
+    geneMakeupGraph(read_info_tsv)
+    upsetPlot(read_info_tsv)
 }
